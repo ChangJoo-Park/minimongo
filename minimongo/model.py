@@ -1,21 +1,26 @@
 # -*- coding: utf-8 -*-
-import copy
+from __future__ import absolute_import
 
+import copy
+import logging
 import re
+
+import six
 from bson import DBRef, ObjectId
-from minimongo.collection import DummyCollection
-from minimongo.options import _Options
-from pymongo import Connection
+from pymongo import MongoClient, MongoReplicaSetClient
+from pymongo.read_preferences import ReadPreference
+
+from .collection import DummyCollection
+from .options import _Options
 
 
 class ModelBase(type):
     """Metaclass for all models.
-
     .. todo:: add Meta inheritance -- so that missing attributes are
               populated from the parrent's Meta if any.
     """
 
-    # A very rudimentary connection pool.
+    # A very rudimentary connection pool, keyed by replicaSet name.
     _connections = {}
 
     def __new__(mcs, name, bases, attrs):
@@ -32,8 +37,8 @@ class ModelBase(type):
         except AttributeError:
             meta = None
         else:
-            delattr(new_class, 'Meta')  # Won't need the original metadata
-                                        # container anymore.
+            # Won't need the original metadata container anymore.
+            delattr(new_class, 'Meta')
 
         options = _Options(meta)
         options.collection = options.collection or to_underscore(name)
@@ -49,21 +54,30 @@ class ModelBase(type):
                 'Model %r improperly configured: %s %s %s' % (
                     name, options.host, options.port, options.database))
 
-        # Checking connection pool for an existing connection.
-        hostport = options.host, options.port
-        if hostport in mcs._connections:
-            connection = mcs._connections[hostport]
+        # Checking connection / client pool for an existing connection / client.
+        pool_key = options.host,options.port
+        if options.replica_set_name:
+            logging.debug("Using replica_set_name=%s as database pool key." % options.replica_set_name)
+            pool_key = options.replica_set_name
+
+        if pool_key in mcs._connections:
+            client = mcs._connections[pool_key]
+            logging.debug("Got database client from pool for pool_key=%s" % (pool_key,))
         else:
-            # _connect=False option
-            # creates :class:`pymongo.connection.Connection` object without
-            # establishing connection. It's required if there is no running
-            # mongodb at this time but we want to create :class:`Model`.
-            connection = Connection(*hostport, _connect=False)
-            mcs._connections[hostport] = connection
+            logging.debug("Creating new database client for pool_key=%s" % (pool_key,))
+            if options.replica_set_name:
+                logging.debug("Setting up a replica set client...")
+                client = MongoReplicaSetClient(options.replica_set_uri, replicaSet=options.replica_set_name)
+                client.read_preference = ReadPreference.SECONDARY_PREFERRED
+            else:
+                logging.debug("Setting up a normal client...")
+                client = MongoClient(options.host, options.port)
+
+            mcs._connections[pool_key] = client
 
         new_class._meta = options
-        new_class.connection = connection
-        new_class.database = connection[options.database]
+        new_class.connection = client
+        new_class.database = client[options.database]
         if options.username and options.password:
             new_class.database.authenticate(options.username, options.password)
         new_class.collection = options.collection_class(
@@ -76,13 +90,11 @@ class ModelBase(type):
 
     def auto_index(mcs):
         """Builds all indices, listed in model's Meta class.
-
            >>> class SomeModel(Model)
            ...     class Meta:
            ...         indices = (
            ...             Index('foo'),
            ...         )
-
         .. note:: this will result in calls to
                   :meth:`pymongo.collection.Collection.ensure_index`
                   method at import time, so import all your models up
@@ -98,13 +110,13 @@ class AttrDict(dict):
         # AttrDict.  Maybe this could be better done with the builtin
         # defaultdict?
         if initial:
-            for key, value in initial.iteritems():
+            for key, value in six.iteritems(initial):
                 # Can't just say self[k] = v here b/c of recursion.
                 self.__setitem__(key, value)
 
         # Process the other arguments (assume they are also default values).
         # This is the same behavior as the regular dict constructor.
-        for key, value in kwargs.iteritems():
+        for key, value in six.iteritems(kwargs):
             self.__setitem__(key, value)
 
         super(AttrDict, self).__init__()
@@ -141,9 +153,10 @@ class AttrDict(dict):
         return super(AttrDict, self).__setitem__(key, new_value)
 
 
+@six.python_2_unicode_compatible
+@six.add_metaclass(ModelBase)
 class Model(AttrDict):
     """Base class for all Minimongo objects.
-
     >>> class Foo(Model):
     ...     class Meta:
     ...         database = 'somewhere'
@@ -157,15 +170,9 @@ class Model(AttrDict):
     >>> foo.bar == 42
     True
     """
-
-    __metaclass__ = ModelBase
-
     def __str__(self):
         return '%s(%s)' % (self.__class__.__name__,
                            super(Model, self).__str__())
-
-    def __unicode__(self):
-        return str(self).decode('utf-8')
 
     def __setitem__(self, key, value):
         # Go through the defined list of field mappers.  If the fild
@@ -186,10 +193,8 @@ class Model(AttrDict):
 
     def dbref(self, with_database=True, **kwargs):
         """Returns a DBRef for the current object.
-
         If `with_database` is False, the resulting :class:`pymongo.dbref.DBRef`
         won't have a :attr:`database` field.
-
         Any other parameters will be passed to the DBRef constructor, as per
         the mongo specs.
         """
@@ -217,15 +222,14 @@ class Model(AttrDict):
 
     def save(self, *args, **kwargs):
         """Save this object to it's mongo collection."""
+        kwargs.pop('safe', None)
         self.collection.save(self, *args, **kwargs)
         return self
 
     def load(self, fields=None, **kwargs):
         """Allow partial loading of a document.
         :attr:fields is a dictionary as per the pymongo specs
-
         self.collection.find_one( self._id, fields={'name': 1} )
-
         """
         values = self.collection.find_one({'_id': self._id},
                                           fields=fields, **kwargs)
@@ -238,10 +242,8 @@ class Model(AttrDict):
 
 def to_underscore(string):
     """Converts a given string from CamelCase to under_score.
-
     >>> to_underscore('FooBar')
     'foo_bar'
     """
     new_string = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', string)
     new_string = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', new_string)
-    return new_string.lower()
